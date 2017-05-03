@@ -235,14 +235,52 @@ public class ExecuteYARNMapReduceJob extends AbstractProcessor {
 	public void onTrigger(ProcessContext context, ProcessSession session)
 			throws ProcessException {
 
+		Map<String, Object> processingData = new HashMap<String, Object>();
 		final FlowFile flowFile = session.get();
 		if (flowFile == null)
 			return;
 
 		FlowFile targetFlowFile = flowFile;
 		final ComponentLog logger = getLogger();
-		final String jobName = loadProperty(context, JOB_NAME, flowFile);
-		final String jobJarPath = loadProperty(context, JOB_JAR_PATH, flowFile);
+
+		Job job;
+		try {
+			Configuration config = buildConfiguration(context, session, flowFile, logger, processingData);
+			logger.info("Configuration created.");
+			job = buildJob(context, session, config, flowFile, logger, processingData);
+			logger.info("Yarn job instance created.");
+			loadDynamicProperties(context, flowFile, context.getProperties(), job, config);
+			logger.info("Yarn dynamic properties loaded.");
+			if (validateJob(context, session, config, job, flowFile, logger, processingData)) {
+				logger.info("Yarn job validated.");
+				job.submit();
+				String yarnAppId = String.format("application_%1s_%2$04d", job.getStatus().getJobID().getJtIdentifier(), job.getStatus().getJobID().getId());
+				targetFlowFile = session.putAttribute(targetFlowFile, ATTR_YARN_JOB_ID, yarnAppId);
+				logger.info("Yarn job {} submited.", new Object[] {yarnAppId});
+				if (job.waitForCompletion(true)) {
+					targetFlowFile = parseJobCounters(context, session, job, targetFlowFile, logger);
+					targetFlowFile = parseSuccessJobOutput(context, session, job, targetFlowFile, logger, yarnAppId);
+				} else {
+					targetFlowFile = parseFailureJobOutput(context, session, job, targetFlowFile, logger, yarnAppId);
+				}
+			} else {
+				logger.warn("Yarn job validation failed.");
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+			throw new ProcessException("Yarn job creation failed.", e);
+		} catch (ClassNotFoundException | InterruptedException e) {
+			e.printStackTrace();
+			throw new ProcessException("Yarn job submit failed.", e);
+		}
+	}
+	
+	protected boolean validateJob(ProcessContext context, ProcessSession session, Configuration config, Job job, FlowFile flowFile, ComponentLog logger, Map<String, Object> processingData) {
+		return true;
+	}
+
+	protected Configuration buildConfiguration(ProcessContext context, ProcessSession session, FlowFile flowFile, ComponentLog logger, Map<String, Object> processingData) throws IOException {
+		Configuration config = getConfiguration();
 		final String jobQueue = loadProperty(context, JOB_QUEUE, flowFile);
 		final String mapperClsName = loadProperty(context, MAPPER_CLASS, flowFile);
 		final String reducerClsName = loadProperty(context, REDUCER_CLASS, flowFile);
@@ -250,68 +288,84 @@ public class ExecuteYARNMapReduceJob extends AbstractProcessor {
 		final String inputFormatClsName = loadProperty(context, INPUT_FORMAT_CLASS, flowFile);
 		final String outputKeyClsName = loadProperty(context, OUTPUT_KEY_CLASS, flowFile);
 		final String outputValueClsName = loadProperty(context, OUTPUT_VALUE_CLASS, flowFile);
-		final Integer reducerNum = loadPropertyAsInteger(context, REDUCER_NUM, flowFile);
-		final String inputPaths = loadProperty(context, INPUT_PATHS, flowFile);
-		final String outputPath = loadProperty(context, OUTPUT_PATH, flowFile);
 
+		logger.info(String.format("Loaded Hadoop Config: %s", config.toString()));
+		config.set("mapred.reducer.new-api", "true");
+		
+		if (!StringUtils.isBlank(jobQueue)) 
+			config.set("mapreduce.job.queuename", jobQueue);
+		if (!StringUtils.isBlank(mapperClsName))
+			config.set(MRJobConfig.MAP_CLASS_ATTR, mapperClsName);
+		if (!StringUtils.isBlank(reducerClsName))
+			config.set(MRJobConfig.REDUCE_CLASS_ATTR, reducerClsName);
+		if (!StringUtils.isBlank(outputKeyClsName))
+			config.set(JobContext.OUTPUT_KEY_CLASS, outputKeyClsName);
+		if (!StringUtils.isBlank(outputValueClsName))
+			config.set(JobContext.OUTPUT_VALUE_CLASS, outputValueClsName);
+		if (!StringUtils.isBlank(combinerClsName))
+			config.set(JobContext.COMBINE_CLASS_ATTR, combinerClsName);
+		if (!StringUtils.isBlank(inputFormatClsName))
+			config.set(JobContext.INPUT_FORMAT_CLASS_ATTR, inputFormatClsName);
+		return config;
+	}
+	
+	protected Job buildJob(ProcessContext context, ProcessSession session, Configuration config, FlowFile flowFile, ComponentLog logger, Map<String, Object> processingData) throws IOException {
 		final String cachedFileUrls = loadProperty(context, CACHED_FILE_URLS, flowFile); // MRJobConfig.CACHE_FILES
 		final String cachedArchivesUrls = loadProperty(context, CACHED_ARCHIVES_URLS, flowFile); // MRJobConfig.CACHE_ARCHIVES
 		final String classPathArchive = loadProperty(context, CLASS_PATH_ARCHIVE, flowFile); // MRJobConfig.CLASSPATH_ARCHIVES
+		final Integer reducerNum = loadPropertyAsInteger(context, REDUCER_NUM, flowFile);
+		final String jobJarPath = loadProperty(context, JOB_JAR_PATH, flowFile);
+		final String jobName = loadProperty(context, JOB_NAME, flowFile);
+		final String inputPaths = loadProperty(context, INPUT_PATHS, flowFile);
+		final String outputPath = loadProperty(context, OUTPUT_PATH, flowFile);
 
-		Configuration config = getConfiguration();
-		logger.info(String.format("Loaded Hadoop Config: %s", config.toString()));
+		Job job = getYarnJobAsUser(config, jobName);
+		if (!StringUtils.isBlank(cachedFileUrls))
+			job.setCacheFiles(org.apache.hadoop.util.StringUtils
+					.stringToURI(StringUtils.split(cachedFileUrls, ','))); // MRJobConfig.CACHE_FILES
+		if (!StringUtils.isBlank(cachedArchivesUrls))
+			job.setCacheArchives(org.apache.hadoop.util.StringUtils
+					.stringToURI(StringUtils.split(cachedArchivesUrls))); // MRJobConfig.CACHE_ARCHIVES
+		if (!StringUtils.isBlank(classPathArchive))
+			job.addArchiveToClassPath(new Path(classPathArchive)); // MRJobConfig.CLASSPATH_ARCHIVES
+		if (reducerNum != null) job.setNumReduceTasks(reducerNum);
+		if (jobJarPath != null) job.setJar(jobJarPath);
+		if (inputPaths != null) {
+			for (String path : StringUtils.split(inputPaths, ',')) {
+				FileInputFormat.addInputPath(job, new Path(path));
+			}
+		}
+		if (outputPath != null) FileOutputFormat.setOutputPath(job, new Path(outputPath));
+		return job;
+	}
 
-		loadDynamicProperties(context, flowFile, context.getProperties(), config);
-
-		Job job;
+	protected FlowFile parseJobCounters(ProcessContext context, ProcessSession session, Job job, FlowFile file, ComponentLog logger) {
+		Counters counters = null;
 		try {
-			if (!StringUtils.isBlank(jobQueue)) 
-				config.set("mapreduce.job.queuename", jobQueue);
-			if (!StringUtils.isBlank(mapperClsName))
-				config.set(MRJobConfig.MAP_CLASS_ATTR, mapperClsName);
-			if (!StringUtils.isBlank(reducerClsName))
-				config.set(MRJobConfig.REDUCE_CLASS_ATTR, reducerClsName);
-			if (!StringUtils.isBlank(outputKeyClsName))
-				config.set(JobContext.OUTPUT_KEY_CLASS, outputKeyClsName);
-			if (!StringUtils.isBlank(outputValueClsName))
-				config.set(JobContext.OUTPUT_VALUE_CLASS, outputValueClsName);
-			if (!StringUtils.isBlank(combinerClsName))
-				config.set(JobContext.COMBINE_CLASS_ATTR, combinerClsName);
-			if (!StringUtils.isBlank(inputFormatClsName))
-				config.set(JobContext.INPUT_FORMAT_CLASS_ATTR,
-						inputFormatClsName);
-			job = getYARNJobAsUser(config, jobName);
-			if (!StringUtils.isBlank(cachedFileUrls))
-				job.setCacheFiles(org.apache.hadoop.util.StringUtils
-						.stringToURI(StringUtils.split(cachedFileUrls, ','))); // MRJobConfig.CACHE_FILES
-			if (!StringUtils.isBlank(cachedArchivesUrls))
-				job.setCacheArchives(org.apache.hadoop.util.StringUtils
-						.stringToURI(StringUtils.split(cachedArchivesUrls))); // MRJobConfig.CACHE_ARCHIVES
-			if (!StringUtils.isBlank(classPathArchive))
-				job.addArchiveToClassPath(new Path(classPathArchive)); // MRJobConfig.CLASSPATH_ARCHIVES
-			if (reducerNum != null) job.setNumReduceTasks(reducerNum);
-			if (jobJarPath != null) job.setJar(jobJarPath);
-			if (inputPaths != null) {
-				for (String path : StringUtils.split(inputPaths, ',')) {
-					FileInputFormat.addInputPath(job, new Path(path));
+			counters = job.getCounters();
+		} catch (IOException ex) {
+			logger.error("Error retrieving counters fromn Yarn job {}", new Object[] {ex});
+		}
+
+		if (counters != null) {
+			long jobOutputSize = 0;
+			for (CounterGroup g : counters) {
+				logger.info("Counter Group: {}", new Object[] {g.getName()});
+
+				Iterator<Counter> it = g.iterator();
+
+				while (it.hasNext()) {
+					Counter c = it.next();
+
+					logger.debug("Counter: {} has value {}", new Object[] {c.getName(), c.getValue()});
+
+					if(c.getName().equals("BYTES_WRITTEN"))
+					jobOutputSize += c.getValue();
 				}
 			}
-			if (outputPath != null) FileOutputFormat.setOutputPath(job, new Path(outputPath));
-			job.submit();
-			String yarnAppId = String.format("application_%1s_%2$04d", job.getStatus().getJobID().getJtIdentifier(), job.getStatus().getJobID().getId());
-			targetFlowFile = session.putAttribute(targetFlowFile, ATTR_YARN_JOB_ID, yarnAppId);
-			if (job.waitForCompletion(true)) {
-				targetFlowFile = parseSuccessJobOutput(context, session, job, targetFlowFile, logger, yarnAppId);
-			} else {
-				targetFlowFile = parseFailureJobOutput(context, session, job, targetFlowFile, logger, yarnAppId);
-			}
-		} catch (IOException e) {
-			e.printStackTrace();
-			throw new ProcessException("YARN job creation failed.", e);
-		} catch (ClassNotFoundException | InterruptedException e) {
-			e.printStackTrace();
-			throw new ProcessException("YARN job submit failed.", e);
+			file = session.putAttribute(file, attrNameBytesWritten, Long.toString(jobOutputSize));
 		}
+		return file;
 	}
 	
 	protected FlowFile parseSuccessJobOutput(ProcessContext context, ProcessSession session, Job job, FlowFile file, ComponentLog logger, String yarnAppId) throws IOException, InterruptedException {
@@ -353,7 +407,7 @@ public class ExecuteYARNMapReduceJob extends AbstractProcessor {
 
 	protected void loadDynamicProperties(final ProcessContext context,
 			final FlowFile flowFile,
-			final Map<PropertyDescriptor, String> properties,
+			final Map<PropertyDescriptor, String> properties, Job job, 
 			Configuration config) {
 		for (final Map.Entry<PropertyDescriptor, String> entry : properties
 				.entrySet()) {
@@ -567,7 +621,7 @@ public class ExecuteYARNMapReduceJob extends AbstractProcessor {
 				yarnResources.set(resources);
 			}
 		} catch (IOException ex) {
-			getLogger().error("HDFS Configuration error - {}",
+			getLogger().error("YARN Configuration error - {}",
 					new Object[] { ex });
 			initYARNResources();
 			throw ex;
@@ -580,7 +634,7 @@ public class ExecuteYARNMapReduceJob extends AbstractProcessor {
 	}
 
 	@OnStopped
-	public final void abstractOnStopped() {
+	public void abstractOnStopped() {
 		initYARNResources();
 	}
 
